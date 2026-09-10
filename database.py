@@ -13,7 +13,8 @@ def db_init():
             is_warmed INTEGER DEFAULT 0,
             data TEXT,
             is_sold INTEGER DEFAULT 0,
-            date_added TEXT
+            date_added TEXT,
+            created_at REAL
         )
     """)
     cursor.execute("""

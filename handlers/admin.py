@@ -1,4 +1,5 @@
 import datetime
+import time
 import random
 import string
 from aiogram import Router, F
@@ -20,25 +21,30 @@ class AutoregStage(StatesGroup):
 class WarmupState(StatesGroup):
     keywords = State()
 
-def calculate_age(date_str):
-    if not date_str: return 0
-    try:
-        return max(0, (datetime.datetime.now() - datetime.datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")).days)
-    except:
-        return 0
+class AdminUserSearch(StatesGroup):
+    user_id = State()
+
+class AdminChangeBalance(StatesGroup):
+    amount = State()
+
+def calculate_age(created_timestamp):
+    if not created_timestamp: return 0
+    return max(0, int((time.time() - created_timestamp) / 86400))
 
 @router.callback_query(F.data == "admin")
-async def cb_admin(callback: CallbackQuery):
+async def cb_admin(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS: return
+    await state.clear()
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT sales_count, total_earned FROM stats")
     stats = cursor.fetchone()
     conn.close()
 
-    text = f"🛠 **Админ-панель**\n\n📊 Продаж: {stats[0]}\n💵 Заработано: {stats[1]}$"
+    text = f"🛠 **Админ-панель**\n\n📊 Продаж: {stats[0]}\n💵 Заработано: {stats[1]} RUB"
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📦 Управление аккаунтами (отлега)", callback_data="admin_accs")],
+        [InlineKeyboardButton(text="📦 Управление аккаунтами", callback_data="admin_accs")],
+        [InlineKeyboardButton(text="👥 Управление пользователями", callback_data="admin_users")],
         [InlineKeyboardButton(text="🤖 Авторег с DuckzMail", callback_data="start_autoreg")],
         [InlineKeyboardButton(text="🔥 Реальный прогрев Playwright", callback_data="start_warmup")],
         [InlineKeyboardButton(text="🔙 На главную", callback_data="back_main")]
@@ -50,7 +56,7 @@ async def cb_admin_accs(callback: CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS: return
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, name, geo, is_sold, price, date_added FROM products")
+    cursor.execute("SELECT id, name, geo, is_sold, price, is_warmed, created_at FROM products")
     prods = cursor.fetchall()
     conn.close()
 
@@ -58,12 +64,100 @@ async def cb_admin_accs(callback: CallbackQuery):
         await callback.message.edit_text("⚠️ Товаров нет.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="admin")]]))
         return
         
-    text = "📦 **Список аккаунтов и отлега:**\n\n"
+    text = "📦 **Список аккаунтов:**\n\n"
     for p in prods:
-        age = calculate_age(p[5])
+        age = calculate_age(p[6]) if p[5] == 1 else 0
         status = "🟢 Доступен" if p[3] == 0 else "🔴 Продан"
-        text += f"ID: `{p[0]}` | **{p[1]}**\n└ Добавлен: `{p[5]}` | Отлега: **{age} дн.** | 💰 {p[4]}$ | {status}\n\n"
+        warm_status = "🔥 Прогретый" if p[5] == 1 else "🌱 Свежерег"
+        text += f"ID: `{p[0]}` | ГЕО: **{p[2]}** | {warm_status}\n└ Отлега: `{age} дн.` | 💰 {p[4]} RUB | {status}\n\n"
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="admin")]]), parse_mode="Markdown")
+
+# --- Управление пользователями и балансом (в RUB) ---
+
+@router.callback_query(F.data == "admin_users")
+async def cb_admin_users(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS: return
+    await callback.message.answer("🔍 Введите **Telegram ID** пользователя для просмотра и управления балансом:", parse_mode="Markdown")
+    await state.set_state(AdminUserSearch.user_id)
+
+@router.message(AdminUserSearch.user_id)
+async def process_admin_search_user(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS: return
+    try:
+        target_id = int(message.text.strip())
+    except ValueError:
+        await message.answer("⚠️ Введите корректный числовой Telegram ID:")
+        return
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, username, balance, purchases_count, total_spent FROM users WHERE user_id = ?", (target_id,))
+    user = cursor.fetchone()
+    conn.close()
+
+    if not user:
+        await message.answer(f"❌ Пользователь с ID `{target_id}` не найден в базе данных.", parse_mode="Markdown")
+        await state.clear()
+        return
+
+    await state.update_data(target_user_id=target_id)
+    text = (
+        f"👤 **Информация о пользователе:**\n\n"
+        f"🆔 ID: `{user[0]}`\n"
+        f"👤 Username: @{user[1]}\n"
+        f"💰 Баланс: `{user[2]} RUB`\n"
+        f"🛒 Всего покупок: `{user[3]}`\n"
+        f"💸 Всего потрачено: `{user[4]} RUB`"
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Изменить баланс (+/- RUB)", callback_data="admin_edit_balance")],
+        [InlineKeyboardButton(text="🔙 В админ-панель", callback_data="admin")]
+    ])
+    await message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
+    await state.set_state(None)
+
+@router.callback_query(F.data == "admin_edit_balance")
+async def cb_admin_edit_balance(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS: return
+    await callback.message.answer(
+        "💵 Введите сумму для изменения баланса в **RUB** (рублях):\n"
+        "• Для пополнения введите положительное число (например: `500`)\n"
+        "• Для списания введите отрицательное число (например: `-200`)",
+        parse_mode="Markdown"
+    )
+    await state.set_state(AdminChangeBalance.amount)
+
+@router.message(AdminChangeBalance.amount)
+async def process_admin_change_balance(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS: return
+    try:
+        delta = float(message.text.replace(",", "."))
+    except ValueError:
+        await message.answer("⚠️ Введите корректное число:")
+        return
+
+    data = await state.get_data()
+    target_id = data.get("target_user_id")
+    if not target_id:
+        await message.answer("❌ Ошибка сессии. Повторите поиск пользователя через админ-панель.")
+        await state.clear()
+        return
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (delta, target_id))
+    cursor.execute("SELECT balance FROM users WHERE user_id = ?", (target_id,))
+    new_balance = cursor.fetchone()[0]
+    conn.commit()
+    conn.close()
+
+    await state.clear()
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛠 В админ-панель", callback_data="admin")]
+    ])
+    await message.answer(f"✅ Баланс пользователя `{target_id}` успешно обновлен!\n💰 Новый баланс: `{new_balance} RUB`", reply_markup=keyboard, parse_mode="Markdown")
+
+# --- Авторег с DuckzMail (с указанием страны и автоматическим определением отлеги) ---
 
 @router.callback_query(F.data == "start_autoreg")
 async def cb_start_autoreg(callback: CallbackQuery, state: FSMContext):
@@ -71,22 +165,23 @@ async def cb_start_autoreg(callback: CallbackQuery, state: FSMContext):
     login = "user_" + "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
     password = "".join(random.choices(string.ascii_letters + string.digits + "!@#$", k=12))
     await state.update_data(login=login, password=password)
-    await callback.message.answer("🌍 Введите ГЕО аккаунта (например: `USA`):", parse_mode="Markdown")
+    await callback.message.answer("🌍 Введите страну рега (ГЕО) аккаунта (например: `USA`, `RU`, `KAZ`):", parse_mode="Markdown")
     await state.set_state(AutoregStage.geo)
 
 @router.message(AutoregStage.geo)
 async def process_geo(message: Message, state: FSMContext):
-    await state.update_data(geo=message.text.upper())
+    await state.update_data(geo=message.text.strip().upper())
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔥 Да", callback_data="w_yes"), InlineKeyboardButton(text="🌱 Нет", callback_data="w_no")]
+        [InlineKeyboardButton(text="🔥 Прогретый (с отлегой)", callback_data="w_yes")],
+        [InlineKeyboardButton(text="🌱 Свежерег (без отлеги)", callback_data="w_no")]
     ])
-    await message.answer("🔥 Аккаунт прогретый?", reply_markup=keyboard)
+    await message.answer("🔥 Какой тип аккаунта создаем?", reply_markup=keyboard)
     await state.set_state(AutoregStage.warm)
 
 @router.callback_query(AutoregStage.warm, F.data.in_({"w_yes", "w_no"}))
 async def process_warm(callback: CallbackQuery, state: FSMContext):
     await state.update_data(warm=1 if callback.data == "w_yes" else 0)
-    await callback.message.answer("💵 Введите цену в **RUB** (например: `300`):")
+    await callback.message.answer("💵 Введите цену в **RUB** (например: `350`):")
     await state.set_state(AutoregStage.price)
 
 @router.message(AutoregStage.price)
@@ -107,20 +202,24 @@ async def process_price(message: Message, state: FSMContext):
         return
         
     acc_str = f"{data['login']}:{data['password']}:{mail['email']}:{mail['password']}"
-    price_usd = round(price_rub / 95.0, 2)
     date_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    name = f"TikTok {data['geo']} | Отлега: 0 дн. | {'Прогретый' if data['warm'] else 'Свежерег'}"
+    created_timestamp = time.time()
+    
+    warm_type = "Прогретый" if data['warm'] == 1 else "Свежерег"
+    name = f"TikTok {data['geo']} | {warm_type}"
     
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO products (category, name, price, geo, is_warmed, data, date_added) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                   ("tiktok", name, price_usd, data['geo'], data['warm'], acc_str, date_str))
+    cursor.execute("""
+        INSERT INTO products (category, name, price, geo, is_warmed, data, date_added, created_at) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("tiktok", name, price_rub, data['geo'], data['warm'], acc_str, date_str, created_timestamp))
     conn.commit()
     conn.close()
     
     await state.clear()
     from handlers.user import main_menu
-    await message.answer(f"✅ Аккаунт с почтой `{mail['email']}` добавлен на витрину!", reply_markup=main_menu(message.from_user.id), parse_mode="Markdown")
+    await message.answer(f"✅ Аккаунт ({data['geo']}, {warm_type}) с почтой `{mail['email']}` добавлен на витрину!", reply_markup=main_menu(message.from_user.id), parse_mode="Markdown")
 
 @router.callback_query(F.data == "start_warmup")
 async def cb_start_warmup(callback: CallbackQuery, state: FSMContext):
